@@ -20,7 +20,8 @@ from telegram.ext import (
 )
 
 # === CONFIG ===
-TOKEN = "8243170913:AAEFdikCRe5WyZuy96ygsGabh0CVO3Steps"
+import os
+TOKEN = os.getenv("TOKEN", "")
 
 DONATE_URL = "https://buymeacoffee.com/brewtechlab"
 DONATE_TEXT = (
@@ -451,4 +452,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
