@@ -354,17 +354,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_log(u.id if u else None, "start")
 
     await update.message.reply_text(
-        "👋 *Welcome to BrewTechLab Downloader!*\n\n"
+        "👋 <b>Welcome to BrewTechLab Downloader!</b>\n\n"
         "Send me a DIRECT file link and I'll download + upload it back to you.\n\n"
-        "📦 *Limits*\n"
+        "📦 <b>Limits</b>\n"
         "• Free: 20 MB\n"
         "• Premium: 50 MB\n\n"
-        "🚀 *Upgrade (claim)*\n\n"
-        "/claim ⭐ Tier 1 — Starter\n"
-        "/claim 🚀 TIER 2 — PRO\n"
-        "/claim 👑 TIER 3 — ULTRA",
+        "🚀 <b>Upgrade (claim)</b>\n\n"
+        "/claim ⭐ Tier 1 - Starter\n"
+        "/claim 🚀 TIER 2 - PRO\n"
+        "/claim 👑 TIER 3 - ULTRA",
         reply_markup=home_keyboard(),
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
 
 
