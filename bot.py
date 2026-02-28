@@ -1,15 +1,11 @@
 import os
 import re
 import sqlite3
-from datetime import datetime, UTC
+from datetime import datetime, UTC, timedelta
 from urllib.parse import urlparse
 
 import httpx
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -20,26 +16,26 @@ from telegram.ext import (
 )
 
 # === CONFIG ===
-import os
 TOKEN = os.getenv("TOKEN", "")
 
-DONATE_URL = "https://buymeacoffee.com/brewtechlab"
-DONATE_TEXT = (
-    "☕ Support BrewTechLab\n\n"
-    "If this bot helps you, you can support the project here:"
-)
+# Put your Telegram numeric user_id here (get it via /myid)
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-MAX_MB = 20
-MAX_BYTES = MAX_MB * 1024 * 1024
+DONATE_URL = "https://buymeacoffee.com/brewtechlab"
+
+FREE_MAX_MB = 20
+PREMIUM_MAX_MB = 50  # change to 100 if you want
+FREE_MAX_BYTES = FREE_MAX_MB * 1024 * 1024
+PREMIUM_MAX_BYTES = PREMIUM_MAX_MB * 1024 * 1024
 
 DB_PATH = "brewtechlab_bot.db"
-
 URL_RE = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
 
 # Callback data
 CB_HELP = "cb_help"
 CB_DONATE = "cb_donate"
 CB_STATS = "cb_stats"
+CB_PREMIUM = "cb_premium"
 
 
 # === DATABASE ===
@@ -79,6 +75,27 @@ def db_init():
         )
     """)
 
+    # Premium table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS premium (
+            user_id INTEGER PRIMARY KEY,
+            expires_at TEXT,
+            granted_by INTEGER,
+            granted_at TEXT
+        )
+    """)
+
+    # Premium requests (manual review)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS premium_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            ts TEXT,
+            note TEXT,
+            status TEXT DEFAULT 'pending' -- pending/approved/rejected
+        )
+    """)
+
     con.commit()
     con.close()
 
@@ -88,7 +105,6 @@ def upsert_user(update: Update):
     if not u:
         return
     now = now_utc()
-
     con = db_connect()
     cur = con.cursor()
     cur.execute("""
@@ -100,6 +116,17 @@ def upsert_user(update: Update):
             last_name=excluded.last_name,
             last_seen=excluded.last_seen
     """, (u.id, u.username, u.first_name, u.last_name, now, now))
+    con.commit()
+    con.close()
+
+
+def add_log(user_id: int | None, event: str, detail: str = ""):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO logs (ts, user_id, event, detail) VALUES (?, ?, ?, ?)",
+        (now_utc(), user_id, event, detail),
+    )
     con.commit()
     con.close()
 
@@ -137,17 +164,6 @@ def inc_donate_opened(user_id: int):
     con.close()
 
 
-def add_log(user_id: int | None, event: str, detail: str = ""):
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute(
-        "INSERT INTO logs (ts, user_id, event, detail) VALUES (?, ?, ?, ?)",
-        (now_utc(), user_id, event, detail),
-    )
-    con.commit()
-    con.close()
-
-
 def get_user_stats(user_id: int) -> tuple[int, int, int] | None:
     con = db_connect()
     cur = con.cursor()
@@ -160,6 +176,86 @@ def get_user_stats(user_id: int) -> tuple[int, int, int] | None:
     if not row:
         return None
     return int(row[0]), int(row[1]), int(row[2])
+
+
+# === PREMIUM ===
+def get_premium_expiry(user_id: int) -> datetime | None:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT expires_at FROM premium WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    con.close()
+    if not row or not row[0]:
+        return None
+    try:
+        return datetime.fromisoformat(row[0])
+    except Exception:
+        return None
+
+
+def is_premium(user_id: int) -> bool:
+    exp = get_premium_expiry(user_id)
+    if not exp:
+        return False
+    return exp > datetime.now(UTC)
+
+
+def set_premium(user_id: int, days: int, granted_by: int):
+    exp = datetime.now(UTC) + timedelta(days=days)
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO premium (user_id, expires_at, granted_by, granted_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            expires_at=excluded.expires_at,
+            granted_by=excluded.granted_by,
+            granted_at=excluded.granted_at
+    """, (user_id, exp.isoformat(), granted_by, now_utc()))
+    con.commit()
+    con.close()
+
+
+def revoke_premium(user_id: int):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("DELETE FROM premium WHERE user_id = ?", (user_id,))
+    con.commit()
+    con.close()
+
+
+def add_premium_request(user_id: int, note: str):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO premium_requests (user_id, ts, note, status) VALUES (?, ?, ?, 'pending')",
+        (user_id, now_utc(), note[:500]),
+    )
+    con.commit()
+    con.close()
+
+
+def list_pending_requests(limit: int = 10):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT id, user_id, ts, note
+        FROM premium_requests
+        WHERE status='pending'
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,))
+    rows = cur.fetchall()
+    con.close()
+    return rows
+
+
+def mark_request(id_: int, status: str):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("UPDATE premium_requests SET status=? WHERE id=?", (status, id_))
+    con.commit()
+    con.close()
 
 
 # === HELPERS ===
@@ -199,6 +295,7 @@ def home_keyboard() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("⬇️ How to use", callback_data=CB_HELP)],
             [InlineKeyboardButton("☕ Donate", callback_data=CB_DONATE)],
+            [InlineKeyboardButton("⭐ Premium", callback_data=CB_PREMIUM)],
             [InlineKeyboardButton("📊 Stats", callback_data=CB_STATS)],
         ]
     )
@@ -208,13 +305,27 @@ def help_text() -> str:
     return (
         "⬇️ How to use\n\n"
         "1) Send a DIRECT file link (mp4/mp3/pdf/jpg/zip...)\n"
-        f"2) Max size: {MAX_MB} MB\n\n"
+        f"2) Free max size: {FREE_MAX_MB} MB\n"
+        f"3) Premium max size: {PREMIUM_MAX_MB} MB\n\n"
         "Notes:\n"
         "- Some websites block automated downloads (HTTP 403).\n"
         "- Links that require login/cookies may fail (HTTP 401).\n\n"
         "Commands:\n"
-        "/start  /help  /donate  /stats"
+        "/start  /help  /donate  /premium  /stats\n"
+        "/requestpremium <your note>\n"
+        "/myid"
     )
+
+
+def premium_text(user_id: int) -> str:
+    if is_premium(user_id):
+        exp = get_premium_expiry(user_id)
+        return f"⭐ Premium: ACTIVE\nExpires: {exp.isoformat() if exp else 'unknown'}\nMax size: {PREMIUM_MAX_MB} MB"
+    return f"⭐ Premium: NOT ACTIVE\nFree max size: {FREE_MAX_MB} MB\nPremium max size: {PREMIUM_MAX_MB} MB"
+
+
+def allowed_max_bytes(user_id: int) -> int:
+    return PREMIUM_MAX_BYTES if is_premium(user_id) else FREE_MAX_BYTES
 
 
 # === COMMANDS ===
@@ -225,7 +336,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "👋 Welcome to BrewTechLab Downloader!\n\n"
-        "Send me a DIRECT file link and I'll download + upload it back to you.",
+        "Send me a DIRECT file link and I'll download + upload it back to you.\n"
+        f"Free max: {FREE_MAX_MB} MB | Premium max: {PREMIUM_MAX_MB} MB",
         reply_markup=home_keyboard(),
     )
 
@@ -234,7 +346,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update)
     u = update.effective_user
     add_log(u.id if u else None, "help_command")
-
     await update.message.reply_text(help_text(), reply_markup=home_keyboard())
 
 
@@ -246,7 +357,10 @@ async def donate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_log(u.id, "donate_command", DONATE_URL)
 
     await update.message.reply_text(
-        DONATE_TEXT,
+        "☕ Support BrewTechLab\n\n"
+        "Donate here and then send /requestpremium with your donation ID or a short note.\n"
+        "Example:\n"
+        "/requestpremium BMC receipt #XXXX\n",
         reply_markup=donate_url_keyboard(),
         disable_web_page_preview=True,
     )
@@ -266,10 +380,167 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msgs, files, donate = stats
+    prem = "ACTIVE" if is_premium(u.id) else "NO"
     await update.message.reply_text(
-        f"📊 Your stats\n\nMessages: {msgs}\nFiles sent: {files}\nDonate opens: {donate}",
+        f"📊 Your stats\n\nMessages: {msgs}\nFiles sent: {files}\nDonate opens: {donate}\nPremium: {prem}",
         reply_markup=home_keyboard(),
     )
+
+
+async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
+    u = update.effective_user
+    if not u:
+        return
+    add_log(u.id, "premium_command")
+    await update.message.reply_text(premium_text(u.id), reply_markup=home_keyboard())
+
+
+async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not u:
+        return
+    await update.message.reply_text(f"Your user_id: {u.id}")
+
+
+async def requestpremium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
+    u = update.effective_user
+    if not u:
+        return
+
+    note = " ".join(context.args).strip()
+    if not note:
+        await update.message.reply_text(
+            "Please include a note.\nExample:\n/requestpremium BMC receipt #XXXX",
+            reply_markup=home_keyboard(),
+        )
+        return
+
+    add_premium_request(u.id, note)
+    add_log(u.id, "premium_request", note[:200])
+
+    await update.message.reply_text(
+        "✅ Premium request received.\n"
+        "An admin will review it soon.\n\n"
+        "Tip: include donation receipt ID or screenshot info.",
+        reply_markup=home_keyboard(),
+    )
+
+    # notify admin (if configured)
+    if ADMIN_ID and ADMIN_ID != 0:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"⭐ New premium request\nuser_id: {u.id}\n@{u.username}\nnote: {note}",
+            )
+        except Exception:
+            pass
+
+
+# === ADMIN COMMANDS ===
+def is_admin(user_id: int) -> bool:
+    return ADMIN_ID != 0 and user_id == ADMIN_ID
+
+
+async def pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not u or not is_admin(u.id):
+        return
+
+    rows = list_pending_requests(limit=10)
+    if not rows:
+        await update.message.reply_text("No pending requests.")
+        return
+
+    text = "🧾 Pending premium requests (latest 10)\n\n"
+    for rid, uid, ts, note in rows:
+        text += f"#{rid} | user_id={uid} | {ts}\n{note}\n\n"
+    text += "Use: /grant <user_id> <days>  (then optionally /markapproved <request_id>)"
+    await update.message.reply_text(text)
+
+
+async def grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not u or not is_admin(u.id):
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /grant <user_id> <days>")
+        return
+
+    try:
+        target_id = int(context.args[0])
+        days = int(context.args[1])
+        if days <= 0:
+            raise ValueError
+    except Exception:
+        await update.message.reply_text("Invalid args. Usage: /grant <user_id> <days>")
+        return
+
+    set_premium(target_id, days=days, granted_by=u.id)
+    add_log(u.id, "admin_grant", f"{target_id} days={days}")
+
+    await update.message.reply_text(f"✅ Granted premium to {target_id} for {days} day(s).")
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"⭐ Premium activated!\nDuration: {days} day(s)\nMax size: {PREMIUM_MAX_MB} MB",
+        )
+    except Exception:
+        pass
+
+
+async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not u or not is_admin(u.id):
+        return
+
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage: /revoke <user_id>")
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Invalid user_id.")
+        return
+
+    revoke_premium(target_id)
+    add_log(u.id, "admin_revoke", str(target_id))
+    await update.message.reply_text(f"✅ Revoked premium from {target_id}.")
+
+
+async def markapproved_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not u or not is_admin(u.id):
+        return
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage: /markapproved <request_id>")
+        return
+    try:
+        rid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Invalid request_id.")
+        return
+    mark_request(rid, "approved")
+    await update.message.reply_text(f"✅ Marked request #{rid} as approved.")
+
+
+async def markrejected_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not u or not is_admin(u.id):
+        return
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage: /markrejected <request_id>")
+        return
+    try:
+        rid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Invalid request_id.")
+        return
+    mark_request(rid, "rejected")
+    await update.message.reply_text(f"✅ Marked request #{rid} as rejected.")
 
 
 # === CALLBACKS (buttons) ===
@@ -290,10 +561,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             inc_donate_opened(user_id)
             add_log(user_id, "cb_donate", DONATE_URL)
         await query.message.reply_text(
-            DONATE_TEXT,
+            "☕ Support BrewTechLab\n\n"
+            "Donate here, then request premium access:\n"
+            "/requestpremium BMC receipt #XXXX",
             reply_markup=donate_url_keyboard(),
             disable_web_page_preview=True,
         )
+
+    elif query.data == CB_PREMIUM:
+        if not user_id:
+            return
+        add_log(user_id, "cb_premium")
+        await query.message.reply_text(premium_text(user_id), reply_markup=home_keyboard())
 
     elif query.data == CB_STATS:
         if not user_id:
@@ -304,8 +583,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("No stats yet.", reply_markup=home_keyboard())
             return
         msgs, files, donate = stats
+        prem = "ACTIVE" if is_premium(user_id) else "NO"
         await query.message.reply_text(
-            f"📊 Your stats\n\nMessages: {msgs}\nFiles sent: {files}\nDonate opens: {donate}",
+            f"📊 Your stats\n\nMessages: {msgs}\nFiles sent: {files}\nDonate opens: {donate}\nPremium: {prem}",
             reply_markup=home_keyboard(),
         )
 
@@ -338,7 +618,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid or blocked URL.", reply_markup=home_keyboard())
         return
 
-    status = await update.message.reply_text("⬇️ Downloading file...")
+    max_bytes = allowed_max_bytes(user_id or 0)
+    max_mb = PREMIUM_MAX_MB if is_premium(user_id or 0) else FREE_MAX_MB
+
+    status = await update.message.reply_text(f"⬇️ Downloading file... (limit {max_mb} MB)")
 
     try:
         headers = {
@@ -395,16 +678,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 async for chunk in response.aiter_bytes(1024 * 128):
                     if not chunk:
                         continue
-
                     downloaded += len(chunk)
-                    if downloaded > MAX_BYTES:
+                    if downloaded > max_bytes:
                         f.close()
                         os.remove(temp_path)
                         if user_id:
                             add_log(user_id, "file_too_large", f"{downloaded} bytes | {url[:300]}")
-                        await status.edit_text(f"❌ File exceeded max size ({MAX_MB} MB).")
+                        await status.edit_text(
+                            f"❌ File exceeded your limit ({max_mb} MB).\n"
+                            "Tip: /premium"
+                        )
                         return
-
                     f.write(chunk)
 
         await status.edit_text("📤 Uploading to Telegram...")
@@ -431,6 +715,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === APP ===
 def main():
+    if not TOKEN:
+        raise RuntimeError("TOKEN is empty. Set environment variable TOKEN.")
+
     db_init()
 
     app = ApplicationBuilder().token(TOKEN).build()
@@ -439,7 +726,17 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("donate", donate_cmd))
+    app.add_handler(CommandHandler("premium", premium_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("myid", myid_cmd))
+    app.add_handler(CommandHandler("requestpremium", requestpremium_cmd))
+
+    # Admin commands
+    app.add_handler(CommandHandler("pending", pending_cmd))
+    app.add_handler(CommandHandler("grant", grant_cmd))
+    app.add_handler(CommandHandler("revoke", revoke_cmd))
+    app.add_handler(CommandHandler("markapproved", markapproved_cmd))
+    app.add_handler(CommandHandler("markrejected", markrejected_cmd))
 
     # Buttons
     app.add_handler(CallbackQueryHandler(on_callback))
@@ -452,5 +749,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
