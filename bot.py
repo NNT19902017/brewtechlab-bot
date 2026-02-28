@@ -353,20 +353,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     add_log(u.id if u else None, "start")
 
-    await update.message.reply_text(
-        "👋 <b>Welcome to BrewTechLab Downloader!</b>\n\n"
-        "Send me a DIRECT file link and I'll download + upload it back to you.\n\n"
-        "📦 <b>Limits</b>\n"
-        "• Free: 20 MB\n"
-        "• Premium: 50 MB\n\n"
-        "🚀 <b>Upgrade (claim)</b>\n\n"
-        "/claim ⭐ Tier 1 - Starter\n"
-        "/claim 🚀 TIER 2 - PRO\n"
-        "/claim 👑 TIER 3 - ULTRA",
-        reply_markup=home_keyboard(),
-        parse_mode="HTML",
-    )
-
+await update.message.reply_text(
+    "👋 <b>Welcome to BrewTechLab Downloader!</b>\n\n"
+    "Send me a DIRECT file link and I'll download + upload it back to you.\n\n"
+    "📦 <b>Limits</b>\n"
+    "• Free: 20 MB\n"
+    "• Premium: 50 MB\n\n"
+    "🚀 <b>Upgrade (claim)</b>\n\n"
+    "/claim ⭐ Tier 1 - Starter\n"
+    "/claim 🚀 TIER 2 - PRO\n"
+    "/claim 👑 TIER 3 - ULTRA",
+    reply_markup=home_keyboard(),
+    parse_mode="HTML",
+)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update)
