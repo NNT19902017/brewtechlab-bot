@@ -450,6 +450,7 @@ async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+
     grant_premium(u.id, tier, TIER_DAYS[tier])
     add_log(u.id, "claim", tier)
 
@@ -458,12 +459,12 @@ async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     limit_mb = get_effective_limit_mb(u.id)
 
     await update.message.reply_text(
-        "✅ Premium activated!\n"
-        f"Tier: {tier.upper()}\n"
-        f"Until: {premium_until}\n"
-        f"New max file size: {limit_mb} MB",
-        reply_markup=home_keyboard(),
-    )
+    "✅ Premium activated!\n"
+    f"Tier: {tier.upper()}\n"
+    f"Expires: {format_expiry(premium_until)}\n"
+    f"Max file size: {limit_mb} MB",
+    reply_markup=home_keyboard(),
+)
 
 
 # =========================
