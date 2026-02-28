@@ -191,10 +191,28 @@ def is_premium_active(premium_until: str | None) -> bool:
         return False
     try:
         dt = datetime.fromisoformat(premium_until)
+
+        # nếu datetime không có timezone → gán UTC
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
         return dt > datetime.now(timezone.utc)
     except Exception:
         return False
 
+
+def format_expiry(dt_str: str | None) -> str:
+    if not dt_str:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(dt_str)
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return dt_str
 
 def get_effective_limit_mb(user_id: int) -> int:
     row = get_user_stats(user_id)
@@ -318,13 +336,15 @@ def help_text(max_mb: int) -> str:
 
 def premium_text() -> str:
     return (
-        "⭐ Premium\n\n"
-        "Claim commands:\n"
+        "⭐ Premium Upgrade\n\n"
+        "Limits:\n"
+        "• Free max: 20 MB\n"
+        "• Premium max: 50 MB\n\n"
+        "Claim one of these tiers:\n\n"
         "/claim ⭐ Tier 1 — Starter  (30 days)\n"
         "/claim 🚀 TIER 2 — PRO      (90 days)\n"
         "/claim 👑 TIER 3 — ULTRA    (365 days)\n\n"
-        "Tip: Premium increases file size limit.\n"
-        f"Donate page: {DONATE_URL}"
+        f"Support project: {DONATE_URL}"
     )
 
 
@@ -336,10 +356,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     add_log(u.id if u else None, "start")
 
-    await update.message.reply_text(
-        "👋 Welcome to BrewTechLab Downloader!\n\n"
-        "Send me a DIRECT file link and I'll download + upload it back to you.",
-        reply_markup=home_keyboard(),
+   await update.message.reply_text(
+    "👋 Welcome to BrewTechLab Downloader!\n\n"
+    "Send me a DIRECT file link and I'll download + upload it back to you.\n\n"
+    "Limits:\n"
+    "• Free max: 20 MB\n"
+    "• Premium max: 50 MB\n\n"
+    "Upgrade (claim):\n"
+    "/claim ⭐ Tier 1 — Starter\n"
+    "/claim 🚀 TIER 2 — PRO\n"
+    "/claim 👑 TIER 3 — ULTRA\n",
+    reply_markup=home_keyboard(),
     )
 
 
