@@ -1,11 +1,17 @@
 import os
 import re
 import sqlite3
-from datetime import datetime, UTC, timedelta
+import tempfile
+import uuid
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import httpx
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -15,20 +21,19 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 
-# === CONFIG ===
-TOKEN = os.getenv("TOKEN", "")
-
-# Put your Telegram numeric user_id here (get it via /myid)
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+# =========================
+# === CONFIG (ENV VARS) ===
+# =========================
+TOKEN = os.getenv("TOKEN", "").strip()
 
 DONATE_URL = "https://buymeacoffee.com/brewtechlab"
-
-FREE_MAX_MB = 20
-PREMIUM_MAX_MB = 50  # change to 100 if you want
-FREE_MAX_BYTES = FREE_MAX_MB * 1024 * 1024
-PREMIUM_MAX_BYTES = PREMIUM_MAX_MB * 1024 * 1024
+DONATE_TEXT = (
+    "☕ Support BrewTechLab\n\n"
+    "If this bot helps you, you can support the project here:"
+)
 
 DB_PATH = "brewtechlab_bot.db"
+
 URL_RE = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
 
 # Callback data
@@ -37,14 +42,32 @@ CB_DONATE = "cb_donate"
 CB_STATS = "cb_stats"
 CB_PREMIUM = "cb_premium"
 
+# =========================
+# === PREMIUM SETTINGS  ===
+# =========================
+# File size limits (MB) by tier
+LIMIT_MB_FREE = 20
+LIMIT_MB_STARTER = 30
+LIMIT_MB_PRO = 45
+LIMIT_MB_ULTRA = 45  # keep safe for Telegram bot upload limits
 
-# === DATABASE ===
+# Premium durations
+TIER_DAYS = {
+    "starter": 30,
+    "pro": 90,
+    "ultra": 365,
+}
+
+
+# =========================
+# === DATABASE          ===
+# =========================
 def db_connect():
-    return sqlite3.connect(DB_PATH)
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
 def now_utc() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def db_init():
@@ -61,7 +84,9 @@ def db_init():
             last_seen TEXT,
             messages_count INTEGER DEFAULT 0,
             files_sent INTEGER DEFAULT 0,
-            donate_opened INTEGER DEFAULT 0
+            donate_opened INTEGER DEFAULT 0,
+            premium_until TEXT,
+            premium_tier TEXT
         )
     """)
 
@@ -75,27 +100,6 @@ def db_init():
         )
     """)
 
-    # Premium table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS premium (
-            user_id INTEGER PRIMARY KEY,
-            expires_at TEXT,
-            granted_by INTEGER,
-            granted_at TEXT
-        )
-    """)
-
-    # Premium requests (manual review)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS premium_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            ts TEXT,
-            note TEXT,
-            status TEXT DEFAULT 'pending' -- pending/approved/rejected
-        )
-    """)
-
     con.commit()
     con.close()
 
@@ -105,28 +109,23 @@ def upsert_user(update: Update):
     if not u:
         return
     now = now_utc()
+
     con = db_connect()
     cur = con.cursor()
     cur.execute("""
-        INSERT INTO users (user_id, username, first_name, last_name, first_seen, last_seen, messages_count, files_sent, donate_opened)
-        VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)
+        INSERT INTO users (
+            user_id, username, first_name, last_name,
+            first_seen, last_seen,
+            messages_count, files_sent, donate_opened,
+            premium_until, premium_tier
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, NULL, NULL)
         ON CONFLICT(user_id) DO UPDATE SET
             username=excluded.username,
             first_name=excluded.first_name,
             last_name=excluded.last_name,
             last_seen=excluded.last_seen
     """, (u.id, u.username, u.first_name, u.last_name, now, now))
-    con.commit()
-    con.close()
-
-
-def add_log(user_id: int | None, event: str, detail: str = ""):
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute(
-        "INSERT INTO logs (ts, user_id, event, detail) VALUES (?, ?, ?, ?)",
-        (now_utc(), user_id, event, detail),
-    )
     con.commit()
     con.close()
 
@@ -164,101 +163,89 @@ def inc_donate_opened(user_id: int):
     con.close()
 
 
-def get_user_stats(user_id: int) -> tuple[int, int, int] | None:
+def add_log(user_id: int | None, event: str, detail: str = ""):
     con = db_connect()
     cur = con.cursor()
     cur.execute(
-        "SELECT messages_count, files_sent, donate_opened FROM users WHERE user_id = ?",
+        "INSERT INTO logs (ts, user_id, event, detail) VALUES (?, ?, ?, ?)",
+        (now_utc(), user_id, event, detail),
+    )
+    con.commit()
+    con.close()
+
+
+def get_user_stats(user_id: int):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT messages_count, files_sent, donate_opened, premium_until, premium_tier FROM users WHERE user_id = ?",
         (user_id,),
     )
     row = cur.fetchone()
     con.close()
-    if not row:
-        return None
-    return int(row[0]), int(row[1]), int(row[2])
+    return row
 
 
-# === PREMIUM ===
-def get_premium_expiry(user_id: int) -> datetime | None:
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute("SELECT expires_at FROM premium WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    con.close()
-    if not row or not row[0]:
-        return None
-    try:
-        return datetime.fromisoformat(row[0])
-    except Exception:
-        return None
-
-
-def is_premium(user_id: int) -> bool:
-    exp = get_premium_expiry(user_id)
-    if not exp:
+def is_premium_active(premium_until: str | None) -> bool:
+    if not premium_until:
         return False
-    return exp > datetime.now(UTC)
+    try:
+        dt = datetime.fromisoformat(premium_until)
+        return dt > datetime.now(timezone.utc)
+    except Exception:
+        return False
 
 
-def set_premium(user_id: int, days: int, granted_by: int):
-    exp = datetime.now(UTC) + timedelta(days=days)
+def get_effective_limit_mb(user_id: int) -> int:
+    row = get_user_stats(user_id)
+    if not row:
+        return LIMIT_MB_FREE
+
+    premium_until = row[3]
+    premium_tier = (row[4] or "").lower().strip()
+
+    if not is_premium_active(premium_until):
+        return LIMIT_MB_FREE
+
+    if premium_tier == "starter":
+        return LIMIT_MB_STARTER
+    if premium_tier == "pro":
+        return LIMIT_MB_PRO
+    if premium_tier == "ultra":
+        return LIMIT_MB_ULTRA
+    return LIMIT_MB_STARTER
+
+
+def grant_premium(user_id: int, tier: str, days: int):
+    tier = tier.lower().strip()
+    now = datetime.now(timezone.utc)
+
     con = db_connect()
     cur = con.cursor()
-    cur.execute("""
-        INSERT INTO premium (user_id, expires_at, granted_by, granted_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            expires_at=excluded.expires_at,
-            granted_by=excluded.granted_by,
-            granted_at=excluded.granted_at
-    """, (user_id, exp.isoformat(), granted_by, now_utc()))
-    con.commit()
-    con.close()
+    cur.execute("SELECT premium_until FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    current_until = row[0] if row else None
 
+    base = now
+    if current_until and is_premium_active(current_until):
+        try:
+            base = datetime.fromisoformat(current_until)
+        except Exception:
+            base = now
 
-def revoke_premium(user_id: int):
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute("DELETE FROM premium WHERE user_id = ?", (user_id,))
-    con.commit()
-    con.close()
+    new_until = base + timedelta(days=days)
 
-
-def add_premium_request(user_id: int, note: str):
-    con = db_connect()
-    cur = con.cursor()
     cur.execute(
-        "INSERT INTO premium_requests (user_id, ts, note, status) VALUES (?, ?, ?, 'pending')",
-        (user_id, now_utc(), note[:500]),
+        "UPDATE users SET premium_until = ?, premium_tier = ?, last_seen = ? WHERE user_id = ?",
+        (new_until.isoformat(), tier, now_utc(), user_id),
     )
     con.commit()
     con.close()
 
 
-def list_pending_requests(limit: int = 10):
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute("""
-        SELECT id, user_id, ts, note
-        FROM premium_requests
-        WHERE status='pending'
-        ORDER BY id DESC
-        LIMIT ?
-    """, (limit,))
-    rows = cur.fetchall()
-    con.close()
-    return rows
-
-
-def mark_request(id_: int, status: str):
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute("UPDATE premium_requests SET status=? WHERE id=?", (status, id_))
-    con.commit()
-    con.close()
-
-
-# === HELPERS ===
+# =========================
+# === HELPERS           ===
+# =========================
 def is_valid_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
@@ -278,10 +265,21 @@ def extract_filename(url: str, content_disposition: str | None) -> str:
             re.IGNORECASE,
         )
         if match:
-            return os.path.basename(match.group(1)).strip() or "download"
+            name = os.path.basename(match.group(1)).strip()
+            return name or "download"
 
     path = urlparse(url).path
-    return os.path.basename(path) or "download"
+    name = os.path.basename(path) or "download"
+    return name
+
+
+def sanitize_filename(name: str) -> str:
+    name = name.strip().replace("\x00", "")
+    name = re.sub(r"[<>:\"/\\|?*\n\r\t]", "_", name)
+    if len(name) > 120:
+        base, ext = os.path.splitext(name)
+        name = base[:100] + ext[:20]
+    return name or "download"
 
 
 def donate_url_keyboard() -> InlineKeyboardMarkup:
@@ -294,41 +292,45 @@ def home_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("⬇️ How to use", callback_data=CB_HELP)],
-            [InlineKeyboardButton("☕ Donate", callback_data=CB_DONATE)],
             [InlineKeyboardButton("⭐ Premium", callback_data=CB_PREMIUM)],
+            [InlineKeyboardButton("☕ Donate", callback_data=CB_DONATE)],
             [InlineKeyboardButton("📊 Stats", callback_data=CB_STATS)],
         ]
     )
 
 
-def help_text() -> str:
+def help_text(max_mb: int) -> str:
     return (
         "⬇️ How to use\n\n"
         "1) Send a DIRECT file link (mp4/mp3/pdf/jpg/zip...)\n"
-        f"2) Free max size: {FREE_MAX_MB} MB\n"
-        f"3) Premium max size: {PREMIUM_MAX_MB} MB\n\n"
+        f"2) Max size (your tier): {max_mb} MB\n\n"
         "Notes:\n"
         "- Some websites block automated downloads (HTTP 403).\n"
         "- Links that require login/cookies may fail (HTTP 401).\n\n"
         "Commands:\n"
-        "/start  /help  /donate  /premium  /stats\n"
-        "/requestpremium <your note>\n"
-        "/myid"
+        "/start  /help  /donate  /stats\n\n"
+        "Premium:\n"
+        "/claim ⭐ Tier 1 — Starter\n"
+        "/claim 🚀 TIER 2 — PRO\n"
+        "/claim 👑 TIER 3 — ULTRA\n"
     )
 
 
-def premium_text(user_id: int) -> str:
-    if is_premium(user_id):
-        exp = get_premium_expiry(user_id)
-        return f"⭐ Premium: ACTIVE\nExpires: {exp.isoformat() if exp else 'unknown'}\nMax size: {PREMIUM_MAX_MB} MB"
-    return f"⭐ Premium: NOT ACTIVE\nFree max size: {FREE_MAX_MB} MB\nPremium max size: {PREMIUM_MAX_MB} MB"
+def premium_text() -> str:
+    return (
+        "⭐ Premium\n\n"
+        "Claim commands:\n"
+        "/claim ⭐ Tier 1 — Starter  (30 days)\n"
+        "/claim 🚀 TIER 2 — PRO      (90 days)\n"
+        "/claim 👑 TIER 3 — ULTRA    (365 days)\n\n"
+        "Tip: Premium increases file size limit.\n"
+        f"Donate page: {DONATE_URL}"
+    )
 
 
-def allowed_max_bytes(user_id: int) -> int:
-    return PREMIUM_MAX_BYTES if is_premium(user_id) else FREE_MAX_BYTES
-
-
-# === COMMANDS ===
+# =========================
+# === COMMANDS          ===
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update)
     u = update.effective_user
@@ -336,8 +338,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "👋 Welcome to BrewTechLab Downloader!\n\n"
-        "Send me a DIRECT file link and I'll download + upload it back to you.\n"
-        f"Free max: {FREE_MAX_MB} MB | Premium max: {PREMIUM_MAX_MB} MB",
+        "Send me a DIRECT file link and I'll download + upload it back to you.",
         reply_markup=home_keyboard(),
     )
 
@@ -346,7 +347,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update)
     u = update.effective_user
     add_log(u.id if u else None, "help_command")
-    await update.message.reply_text(help_text(), reply_markup=home_keyboard())
+
+    max_mb = get_effective_limit_mb(u.id) if u else LIMIT_MB_FREE
+    await update.message.reply_text(help_text(max_mb), reply_markup=home_keyboard())
 
 
 async def donate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -357,10 +360,7 @@ async def donate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_log(u.id, "donate_command", DONATE_URL)
 
     await update.message.reply_text(
-        "☕ Support BrewTechLab\n\n"
-        "Donate here and then send /requestpremium with your donation ID or a short note.\n"
-        "Example:\n"
-        "/requestpremium BMC receipt #XXXX\n",
+        DONATE_TEXT,
         reply_markup=donate_url_keyboard(),
         disable_web_page_preview=True,
     )
@@ -372,178 +372,76 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not u:
         return
 
-    stats = get_user_stats(u.id)
+    row = get_user_stats(u.id)
     add_log(u.id, "stats_command")
 
-    if not stats:
+    if not row:
         await update.message.reply_text("No stats yet.", reply_markup=home_keyboard())
         return
 
-    msgs, files, donate = stats
-    prem = "ACTIVE" if is_premium(u.id) else "NO"
+    msgs, files, donate, premium_until, premium_tier = row
+    prem = "YES ✅" if is_premium_active(premium_until) else "NO ❌"
+    until_line = f"\nUntil: {premium_until}" if is_premium_active(premium_until) else ""
+    tier_line = f"\nTier: {str(premium_tier).upper()}" if is_premium_active(premium_until) else ""
+    limit_mb = get_effective_limit_mb(u.id)
+
     await update.message.reply_text(
-        f"📊 Your stats\n\nMessages: {msgs}\nFiles sent: {files}\nDonate opens: {donate}\nPremium: {prem}",
+        "📊 Your stats\n\n"
+        f"Messages: {int(msgs)}\n"
+        f"Files sent: {int(files)}\n"
+        f"Donate opens: {int(donate)}\n"
+        f"Premium: {prem}{tier_line}{until_line}\n"
+        f"Max file size: {limit_mb} MB",
         reply_markup=home_keyboard(),
     )
 
 
-async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    upsert_user(update)
-    u = update.effective_user
-    if not u:
-        return
-    add_log(u.id, "premium_command")
-    await update.message.reply_text(premium_text(u.id), reply_markup=home_keyboard())
-
-
-async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    if not u:
-        return
-    await update.message.reply_text(f"Your user_id: {u.id}")
-
-
-async def requestpremium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update)
     u = update.effective_user
     if not u:
         return
 
-    note = " ".join(context.args).strip()
-    if not note:
+    inc_messages(u.id)
+
+    text = (update.message.text or "").lower()
+
+    # Match by tier keywords
+    if ("starter" in text) or ("tier 1" in text):
+        tier = "starter"
+    elif ("pro" in text) or ("tier 2" in text):
+        tier = "pro"
+    elif ("ultra" in text) or ("tier 3" in text):
+        tier = "ultra"
+    else:
         await update.message.reply_text(
-            "Please include a note.\nExample:\n/requestpremium BMC receipt #XXXX",
+            "Usage:\n"
+            "/claim ⭐ Tier 1 — Starter\n"
+            "/claim 🚀 TIER 2 — PRO\n"
+            "/claim 👑 TIER 3 — ULTRA",
             reply_markup=home_keyboard(),
         )
         return
 
-    add_premium_request(u.id, note)
-    add_log(u.id, "premium_request", note[:200])
+    grant_premium(u.id, tier, TIER_DAYS[tier])
+    add_log(u.id, "claim", tier)
+
+    row = get_user_stats(u.id)
+    premium_until = row[3] if row else None
+    limit_mb = get_effective_limit_mb(u.id)
 
     await update.message.reply_text(
-        "✅ Premium request received.\n"
-        "An admin will review it soon.\n\n"
-        "Tip: include donation receipt ID or screenshot info.",
+        "✅ Premium activated!\n"
+        f"Tier: {tier.upper()}\n"
+        f"Until: {premium_until}\n"
+        f"New max file size: {limit_mb} MB",
         reply_markup=home_keyboard(),
     )
 
-    # notify admin (if configured)
-    if ADMIN_ID and ADMIN_ID != 0:
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=f"⭐ New premium request\nuser_id: {u.id}\n@{u.username}\nnote: {note}",
-            )
-        except Exception:
-            pass
 
-
-# === ADMIN COMMANDS ===
-def is_admin(user_id: int) -> bool:
-    return ADMIN_ID != 0 and user_id == ADMIN_ID
-
-
-async def pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    if not u or not is_admin(u.id):
-        return
-
-    rows = list_pending_requests(limit=10)
-    if not rows:
-        await update.message.reply_text("No pending requests.")
-        return
-
-    text = "🧾 Pending premium requests (latest 10)\n\n"
-    for rid, uid, ts, note in rows:
-        text += f"#{rid} | user_id={uid} | {ts}\n{note}\n\n"
-    text += "Use: /grant <user_id> <days>  (then optionally /markapproved <request_id>)"
-    await update.message.reply_text(text)
-
-
-async def grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    if not u or not is_admin(u.id):
-        return
-
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /grant <user_id> <days>")
-        return
-
-    try:
-        target_id = int(context.args[0])
-        days = int(context.args[1])
-        if days <= 0:
-            raise ValueError
-    except Exception:
-        await update.message.reply_text("Invalid args. Usage: /grant <user_id> <days>")
-        return
-
-    set_premium(target_id, days=days, granted_by=u.id)
-    add_log(u.id, "admin_grant", f"{target_id} days={days}")
-
-    await update.message.reply_text(f"✅ Granted premium to {target_id} for {days} day(s).")
-    try:
-        await context.bot.send_message(
-            chat_id=target_id,
-            text=f"⭐ Premium activated!\nDuration: {days} day(s)\nMax size: {PREMIUM_MAX_MB} MB",
-        )
-    except Exception:
-        pass
-
-
-async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    if not u or not is_admin(u.id):
-        return
-
-    if len(context.args) < 1:
-        await update.message.reply_text("Usage: /revoke <user_id>")
-        return
-
-    try:
-        target_id = int(context.args[0])
-    except Exception:
-        await update.message.reply_text("Invalid user_id.")
-        return
-
-    revoke_premium(target_id)
-    add_log(u.id, "admin_revoke", str(target_id))
-    await update.message.reply_text(f"✅ Revoked premium from {target_id}.")
-
-
-async def markapproved_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    if not u or not is_admin(u.id):
-        return
-    if len(context.args) < 1:
-        await update.message.reply_text("Usage: /markapproved <request_id>")
-        return
-    try:
-        rid = int(context.args[0])
-    except Exception:
-        await update.message.reply_text("Invalid request_id.")
-        return
-    mark_request(rid, "approved")
-    await update.message.reply_text(f"✅ Marked request #{rid} as approved.")
-
-
-async def markrejected_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    if not u or not is_admin(u.id):
-        return
-    if len(context.args) < 1:
-        await update.message.reply_text("Usage: /markrejected <request_id>")
-        return
-    try:
-        rid = int(context.args[0])
-    except Exception:
-        await update.message.reply_text("Invalid request_id.")
-        return
-    mark_request(rid, "rejected")
-    await update.message.reply_text(f"✅ Marked request #{rid} as rejected.")
-
-
-# === CALLBACKS (buttons) ===
+# =========================
+# === CALLBACKS         ===
+# =========================
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -554,43 +452,53 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == CB_HELP:
         if user_id:
             add_log(user_id, "cb_help")
-        await query.message.reply_text(help_text(), reply_markup=home_keyboard())
+        max_mb = get_effective_limit_mb(user_id) if user_id else LIMIT_MB_FREE
+        await query.message.reply_text(help_text(max_mb), reply_markup=home_keyboard())
+
+    elif query.data == CB_PREMIUM:
+        if user_id:
+            add_log(user_id, "cb_premium")
+        await query.message.reply_text(premium_text(), reply_markup=home_keyboard())
 
     elif query.data == CB_DONATE:
         if user_id:
             inc_donate_opened(user_id)
             add_log(user_id, "cb_donate", DONATE_URL)
         await query.message.reply_text(
-            "☕ Support BrewTechLab\n\n"
-            "Donate here, then request premium access:\n"
-            "/requestpremium BMC receipt #XXXX",
+            DONATE_TEXT,
             reply_markup=donate_url_keyboard(),
             disable_web_page_preview=True,
         )
-
-    elif query.data == CB_PREMIUM:
-        if not user_id:
-            return
-        add_log(user_id, "cb_premium")
-        await query.message.reply_text(premium_text(user_id), reply_markup=home_keyboard())
 
     elif query.data == CB_STATS:
         if not user_id:
             return
         add_log(user_id, "cb_stats")
-        stats = get_user_stats(user_id)
-        if not stats:
+        row = get_user_stats(user_id)
+        if not row:
             await query.message.reply_text("No stats yet.", reply_markup=home_keyboard())
             return
-        msgs, files, donate = stats
-        prem = "ACTIVE" if is_premium(user_id) else "NO"
+
+        msgs, files, donate, premium_until, premium_tier = row
+        prem = "YES ✅" if is_premium_active(premium_until) else "NO ❌"
+        until_line = f"\nUntil: {premium_until}" if is_premium_active(premium_until) else ""
+        tier_line = f"\nTier: {str(premium_tier).upper()}" if is_premium_active(premium_until) else ""
+        limit_mb = get_effective_limit_mb(user_id)
+
         await query.message.reply_text(
-            f"📊 Your stats\n\nMessages: {msgs}\nFiles sent: {files}\nDonate opens: {donate}\nPremium: {prem}",
+            "📊 Your stats\n\n"
+            f"Messages: {int(msgs)}\n"
+            f"Files sent: {int(files)}\n"
+            f"Donate opens: {int(donate)}\n"
+            f"Premium: {prem}{tier_line}{until_line}\n"
+            f"Max file size: {limit_mb} MB",
             reply_markup=home_keyboard(),
         )
 
 
-# === MESSAGE (download) ===
+# =========================
+# === MESSAGE (DOWNLOAD) ===
+# =========================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update)
     u = update.effective_user
@@ -618,10 +526,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid or blocked URL.", reply_markup=home_keyboard())
         return
 
-    max_bytes = allowed_max_bytes(user_id or 0)
-    max_mb = PREMIUM_MAX_MB if is_premium(user_id or 0) else FREE_MAX_MB
+    # premium-aware limits
+    limit_mb = get_effective_limit_mb(user_id) if user_id else LIMIT_MB_FREE
+    max_bytes = int(limit_mb * 1024 * 1024)
 
-    status = await update.message.reply_text(f"⬇️ Downloading file... (limit {max_mb} MB)")
+    status = await update.message.reply_text("⬇️ Downloading file...")
 
     try:
         headers = {
@@ -637,10 +546,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         async with httpx.AsyncClient(
             follow_redirects=True,
-            timeout=40.0,
+            timeout=60.0,
             headers=headers,
         ) as client:
-
             response = await client.get(url)
 
             if response.status_code == 403:
@@ -669,11 +577,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             content_disposition = response.headers.get("content-disposition")
-            filename = extract_filename(url, content_disposition)
+            filename = sanitize_filename(extract_filename(url, content_disposition))
 
-            temp_path = os.path.join(os.getcwd(), f"temp_{filename}")
+            # unique temp file
+            suffix = os.path.splitext(filename)[1]
+            tmp_name = f"bt_{uuid.uuid4().hex}{suffix}"
+            temp_path = os.path.join(tempfile.gettempdir(), tmp_name)
+
             downloaded = 0
-
             with open(temp_path, "wb") as f:
                 async for chunk in response.aiter_bytes(1024 * 128):
                     if not chunk:
@@ -681,30 +592,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     downloaded += len(chunk)
                     if downloaded > max_bytes:
                         f.close()
-                        os.remove(temp_path)
+                        try:
+                            os.remove(temp_path)
+                        except Exception:
+                            pass
                         if user_id:
                             add_log(user_id, "file_too_large", f"{downloaded} bytes | {url[:300]}")
-                        await status.edit_text(
-                            f"❌ File exceeded your limit ({max_mb} MB).\n"
-                            "Tip: /premium"
-                        )
+                        await status.edit_text(f"❌ File exceeded max size ({limit_mb} MB).")
                         return
                     f.write(chunk)
 
         await status.edit_text("📤 Uploading to Telegram...")
 
-        await update.message.reply_document(
-            document=open(temp_path, "rb"),
-            filename=filename,
-            caption=f"✅ Download complete ({downloaded/1024/1024:.1f} MB)\n{url}",
-            reply_markup=donate_url_keyboard(),
-        )
+        with open(temp_path, "rb") as fp:
+            await update.message.reply_document(
+                document=fp,
+                filename=filename,
+                caption=f"✅ Download complete ({downloaded/1024/1024:.1f} MB)\n{url}",
+                reply_markup=donate_url_keyboard(),
+            )
 
         if user_id:
             inc_files_sent(user_id)
             add_log(user_id, "file_sent", f"{filename} | {downloaded} bytes")
 
-        os.remove(temp_path)
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+
         await status.delete()
 
     except Exception as e:
@@ -713,10 +629,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.edit_text(f"⚠️ Error: {str(e)}")
 
 
-# === APP ===
+# =========================
+# === APP              ===
+# =========================
 def main():
     if not TOKEN:
-        raise RuntimeError("TOKEN is empty. Set environment variable TOKEN.")
+        raise RuntimeError("Missing TOKEN env var. Set TOKEN in Railway Variables.")
 
     db_init()
 
@@ -726,17 +644,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("donate", donate_cmd))
-    app.add_handler(CommandHandler("premium", premium_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("myid", myid_cmd))
-    app.add_handler(CommandHandler("requestpremium", requestpremium_cmd))
-
-    # Admin commands
-    app.add_handler(CommandHandler("pending", pending_cmd))
-    app.add_handler(CommandHandler("grant", grant_cmd))
-    app.add_handler(CommandHandler("revoke", revoke_cmd))
-    app.add_handler(CommandHandler("markapproved", markapproved_cmd))
-    app.add_handler(CommandHandler("markrejected", markrejected_cmd))
+    app.add_handler(CommandHandler("claim", claim_cmd))
 
     # Buttons
     app.add_handler(CallbackQueryHandler(on_callback))
@@ -745,7 +654,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("Bot is running...")
-    app.run_polling()
+    app.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
